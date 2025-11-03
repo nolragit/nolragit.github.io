@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>실시간 코인 급등 알림 (15분/5%)</title>
+    <!-- Tailwind CSS 로드 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0d1117;
+            color: #c9d1d9;
+        }
+        .card {
+            background-color: #161b22;
+            border: 1px solid #30363d;
+        }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+        }
+        .dot-red { background-color: #f85149; }
+        .dot-green { background-color: #3fb950; }
+        .dot-yellow { background-color: #ffd666; }
+        /* 스크롤바 스타일 */
+        #alertLog::-webkit-scrollbar,
+        #monitorList::-webkit-scrollbar {
+            width: 8px;
+        }
+        #alertLog::-webkit-scrollbar-thumb,
+        #monitorList::-webkit-scrollbar-thumb {
+            background-color: #484f58;
+            border-radius: 4px;
+        }
+        .loading-spinner {
+            border: 4px solid rgba(255, 255, 255, 0.1);
+            border-top: 4px solid #3b82f6;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-3xl font-bold mb-6 text-white text-center">📈 실시간 급등 감지 시스템 (15분 / 5%)</h1>
+
+        <!-- 설정 및 상태 영역 -->
+        <div class="card p-4 rounded-xl shadow-lg mb-6">
+            <div class="flex flex-col md:flex-row justify-between items-center space-y-4 md:space-y-0">
+                <div id="connectionStatus" class="flex items-center text-sm font-medium">
+                    <span class="status-dot dot-yellow" id="statusDot"></span>
+                    <span id="statusText">연결 대기 중...</span>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <div class="text-sm font-semibold">기준: 15분 봉 / +5%</div>
+                    <button id="startButton" onclick="toggleMonitor()" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition duration-200 shadow-md">
+                        모니터링 시작
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 메인 콘텐츠: 모니터링 리스트와 알림 로그 -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+            <!-- 모니터링 종목 리스트 (간단 표시) -->
+            <div class="lg:col-span-1 card p-4 rounded-xl shadow-lg">
+                <h2 class="text-lg font-semibold mb-3 text-white">👀 모니터링 종목 (<span id="symbolCount">0</span>개)</h2>
+                <div id="monitorList" class="h-64 overflow-y-auto text-xs space-y-1">
+                    <!-- 종목 목록이 여기에 로드됩니다. -->
+                    <div class="text-center text-gray-500 py-4">시작 버튼을 눌러주세요.</div>
+                </div>
+            </div>
+
+            <!-- 실시간 알림 로그 -->
+            <div class="lg:col-span-2 card p-4 rounded-xl shadow-lg">
+                <h2 class="text-lg font-semibold mb-3 text-white">🚨 급등 알림 로그</h2>
+                <div id="alertLog" class="h-64 overflow-y-auto space-y-2">
+                    <!-- 알림 메시지가 여기에 추가됩니다. -->
+                    <div class="text-center text-gray-500 py-4">알림이 발생하면 여기에 표시됩니다.</div>
+                </div>
+            </div>
+
+        </div>
+
+    </div>
+
+<script>
+    // =================================================================
+    // 1. 설정 및 전역 변수
+    // =================================================================
+
+    // Binance API 엔드포인트
+    const BINANCE_REST_BASE = 'https://fapi.binance.com'; // 선물 REST API
+    const BINANCE_WS_BASE = 'wss://fstream.binance.com/stream?streams='; // 선물 WebSocket API
+    
+    // 분석 기준 설정
+    const INTERVAL = '1m'; // WS 및 REST API 조회 간격
+    const CANDLE_COUNT = 15; // 15분봉 기준 (1m 캔들 15개)
+    const SURGE_THRESHOLD = 0.05; // 5% (5/100)
+    const MAX_RETRIES = 5; // REST API 재시도 횟수
+    
+    // 모니터링할 대표적인 선물 종목 리스트 (Binance USDT-M Futures)
+    const BASE_SYMBOLS = [
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", 
+        "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", 
+        "TRXUSDT", "MATICUSDT", "LTCUSDT", "BCHUSDT", "UNIUSDT",
+        "NEARUSDT", "APTUSDT", "ATOMUSDT", "ETCUSDT", "AXSUSDT",
+        "FILUSDT", "SANDUSDT", "FTMUSDT", "AAVEUSDT", "THETAUSDT"
+    ];
+
+    let ws = null;
+    let isMonitoring = false;
+    // { 'BTCUSDT': { history: [kline], alertTime: null, lastPrice: 0, openPrice: 0, isLoading: true }, ... }
+    let symbolData = {}; 
+
+    // DOM 요소 캐시
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const startButton = document.getElementById('startButton');
+    const alertLog = document.getElementById('alertLog');
+    const monitorListDiv = document.getElementById('monitorList');
+    const symbolCountSpan = document.getElementById('symbolCount');
+
+
+    // =================================================================
+    // 2. 초기화 및 UI 함수
+    // =================================================================
+
+    function updateStatus(text, type = 'yellow') {
+        statusText.textContent = text;
+        statusDot.className = `status-dot ${type === 'green' ? 'dot-green' : type === 'red' ? 'dot-red' : 'dot-yellow'}`;
+    }
+
+    function logAlert(symbol, change, price) {
+        const now = new Date();
+        const timeString = now.toLocaleTimeString('ko-KR');
+
+        const newLog = document.createElement('div');
+        newLog.className = 'p-3 rounded-lg bg-red-800/30 border border-red-700/50 flex flex-col transition duration-300 transform hover:scale-[1.01]';
+        newLog.innerHTML = `
+            <div class="font-bold text-lg text-red-400">${symbol} 🚀 급등 감지!</div>
+            <div class="text-sm text-gray-300">
+                [${timeString}] 변동률: <span class="text-xl font-extrabold text-red-300">${(change * 100).toFixed(2)}%</span>
+                / 현재가: $${price.toFixed(4)}
+            </div>
+        `;
+        alertLog.prepend(newLog); // 최신 알림을 위로 추가
+        
+        // 너무 많은 로그 방지
+        if (alertLog.children.length > 50) {
+            alertLog.removeChild(alertLog.lastChild);
+        }
+    }
+    
+    function updateMonitorListUI() {
+        monitorListDiv.innerHTML = ''; // 초기화
+        const symbols = Object.keys(symbolData).sort();
+        symbolCountSpan.textContent = symbols.length;
+
+        symbols.forEach(symbol => {
+            const data = symbolData[symbol];
+            const div = document.createElement('div');
+            
+            let changeText = '';
+            let isLoaded = data.history.length >= CANDLE_COUNT;
+
+            if (data.isLoading) {
+                // 데이터 로딩 중
+                changeText = `<div class="loading-spinner ml-2"></div>`;
+            } else if (!isLoaded) {
+                 // 로딩이 끝났지만 캔들 수가 부족한 경우 (이럴 일은 REST API로 인해 없어야 함)
+                 changeText = '데이터 수집 중...'; 
+            } else {
+                 // 데이터 로드 완료 및 계산 가능
+                 const currentPrice = data.history[data.history.length - 1].close;
+                 const openPrice = data.history[0].open;
+                 const change = (currentPrice - openPrice) / openPrice;
+                 const color = change >= SURGE_THRESHOLD ? 'text-red-500 font-extrabold' : change > 0 ? 'text-green-500' : 'text-gray-500';
+                 changeText = `<span class="${color}">${(change * 100).toFixed(2)}%</span>`;
+            }
+            
+            // 현재 가격 기반 색상 (Last Close Price)
+            const priceColor = data.lastPrice > 0 ? (data.lastPrice >= data.openPrice ? 'text-green-400' : 'text-red-400') : 'text-gray-400';
+
+            div.className = 'flex justify-between p-1.5 border-b border-gray-700/50 last:border-b-0 items-center';
+            div.innerHTML = `
+                <span class="font-medium">${symbol}</span>
+                <span class="text-right text-xs flex items-center">
+                    15m 변동률: ${changeText}
+                </span>
+            `;
+            monitorListDiv.appendChild(div);
+        });
+    }
+
+    // =================================================================
+    // 3. REST API를 이용한 초기 데이터 로딩 (안정성 개선)
+    // =================================================================
+
+    // 지수 백오프를 이용한 REST API 호출
+    async function fetchKlineData(symbol, retryCount = 0) {
+        // limit: 요청할 캔들 수. CANDLE_COUNT(15) + 1 (최신 캔들의 Close price를 가져오기 위해)
+        const url = `${BINANCE_REST_BASE}/fapi/v1/klines?symbol=${symbol}&interval=${INTERVAL}&limit=${CANDLE_COUNT + 1}`;
+        
+        try {
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            const data = await response.json();
+
+            // Binance klines 형식: [ timestamp, open, high, low, close, volume, ... ]
+            // 캔들 마감 시간(0), open(1), high(2), low(3), close(4), volume(5)
+            
+            // 마지막 미완성 캔들(0)과 이전 15개 캔들(1~15)을 가져와야 함.
+            if (data.length < CANDLE_COUNT) {
+                 console.warn(`${symbol}: Not enough historical data (${data.length} found). Skipping initial calculation.`);
+                 return []; // 데이터가 부족하면 빈 배열 반환
+            }
+            
+            // 캔들 데이터 파싱
+            // 15분 급등 계산을 위해 (CANDLE_COUNT)개의 캔들을 필요로 함.
+            // data[0]은 가장 오래된 캔들, data[14]는 가장 최근에 마감된 캔들.
+            // data[15]는 현재 진행 중인 캔들 (미완성)이므로, history에 포함하지 않습니다.
+
+            const parsedHistory = data.slice(0, CANDLE_COUNT).map(k => ({
+                open: parseFloat(k[1]),
+                close: parseFloat(k[4]),
+                high: parseFloat(k[2]),
+                low: parseFloat(k[3]),
+                volume: parseFloat(k[5]),
+                timestamp: k[0]
+            }));
+
+            // 마지막 마감된 캔들의 가격을 WebSocket 연결 전 LastPrice로 설정
+            if(parsedHistory.length > 0) {
+                 symbolData[symbol].lastPrice = parsedHistory[parsedHistory.length - 1].close;
+                 symbolData[symbol].openPrice = parsedHistory[parsedHistory.length - 1].open;
+            }
+
+            return parsedHistory;
+
+        } catch (error) {
+            if (retryCount < MAX_RETRIES) {
+                const delay = Math.pow(2, retryCount) * 1000 + Math.random() * 1000; // 지수 백오프 + 랜덤 지연
+                console.warn(`[${symbol}] REST API 호출 오류: ${error.message}. ${delay / 1000}초 후 재시도... (${retryCount + 1}/${MAX_RETRIES})`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return fetchKlineData(symbol, retryCount + 1); // 재귀 호출
+            } else {
+                console.error(`[${symbol}] REST API 호출 최종 실패: ${error.message}. 초기 데이터 로딩 실패.`);
+                return [];
+            }
+        }
+    }
+
+    async function loadInitialData() {
+        startButton.disabled = true;
+        startButton.innerHTML = `<span class="loading-spinner mr-2"></span> 데이터 로딩 중...`;
+        updateStatus('초기 데이터 로딩 중...', 'yellow');
+        
+        // 1. symbolData 구조 초기화 및 로딩 플래그 설정
+        symbolData = {};
+        BASE_SYMBOLS.forEach(s => {
+            symbolData[s] = { history: [], alertTime: null, lastPrice: 0, openPrice: 0, isLoading: true };
+        });
+        updateMonitorListUI();
+
+        // 2. 모든 종목의 초기 데이터 병렬 로딩
+        const loadPromises = BASE_SYMBOLS.map(async (symbol) => {
+            const history = await fetchKlineData(symbol);
+            if (history.length === CANDLE_COUNT) {
+                symbolData[symbol].history = history;
+            }
+            symbolData[symbol].isLoading = false;
+        });
+
+        // 3. 모든 로딩이 완료될 때까지 대기
+        await Promise.all(loadPromises);
+        
+        startButton.disabled = false;
+        startButton.textContent = '모니터링 시작';
+        updateStatus('연결 대기 중...', 'yellow');
+        
+        // 초기 데이터 로딩 후 UI 업데이트 (급등 여부 바로 계산 가능)
+        updateMonitorListUI();
+        
+        // 로딩 완료 후 (선택 사항): 급등 감지 로직을 한 번 실행하여 현재 상태 확인
+        BASE_SYMBOLS.forEach(symbol => {
+             if (symbolData[symbol].history.length === CANDLE_COUNT) {
+                 calculateSurge(symbol);
+             }
+        });
+    }
+
+    // =================================================================
+    // 4. WebSocket 및 핵심 로직
+    // =================================================================
+
+    function calculateSurge(symbol) {
+        const data = symbolData[symbol];
+        
+        // 15분 데이터를 모두 모았는지 확인 (초기 로딩 성공 시 true)
+        if (data.history.length < CANDLE_COUNT) {
+            return;
+        }
+
+        // 15분 전 (15번째) 캔들의 Open Price (15분 구간의 시작 가격)
+        const openPrice15m = data.history[0].open;
+        
+        // 현재 (마지막) 캔들의 Close Price
+        const currentPrice = data.history[data.history.length - 1].close;
+
+        const change = (currentPrice - openPrice15m) / openPrice15m;
+        
+        // 5% 이상 급등 감지
+        if (change >= SURGE_THRESHOLD) {
+            
+            // 알림 중복 방지 로직: 이미 알림이 발생한 후 15분 동안은 다시 알림을 발생시키지 않음
+            const now = Date.now();
+            const lastAlert = data.alertTime || 0;
+            const cooldownPeriod = 15 * 60 * 1000; // 15분 쿨다운
+
+            if (now - lastAlert > cooldownPeriod) {
+                logAlert(symbol, change, currentPrice);
+                symbolData[symbol].alertTime = now; // 알림 발생 시간 기록
+            }
+        }
+    }
+
+    function handleMessage(event) {
+        const message = JSON.parse(event.data);
+
+        // Binance Combined Stream 형식 확인
+        if (message.stream && message.data && message.data.k) {
+            const kline = message.data.k;
+            const symbol = kline.s;
+            const isFinal = kline.x; // 캔들 마감 여부 (true = 마감)
+
+            if (!symbolData[symbol]) return;
+
+            // 캔들 데이터 추출: [Open, Close, High, Low, Volume]
+            const candle = {
+                open: parseFloat(kline.o),
+                close: parseFloat(kline.c),
+                high: parseFloat(kline.h),
+                low: parseFloat(kline.l),
+                volume: parseFloat(kline.v),
+                timestamp: kline.T // 캔들 마감 시간
+            };
+            
+            // 실시간 가격 업데이트 (UI 목록 업데이트용)
+            symbolData[symbol].lastPrice = candle.close;
+            symbolData[symbol].openPrice = candle.open;
+
+
+            // 캔들이 마감되었을 때만 (안정적인 데이터)
+            if (isFinal) {
+                let history = symbolData[symbol].history;
+                
+                // 새로운 캔들을 추가
+                // **중요**: 초기 데이터 로딩 후, WebSocket은 REST API가 불러온 마지막 캔들과 
+                // 동일한 캔들을 마감할 수 있습니다. 중복 방지 로직이 필요합니다.
+                
+                // 현재 history에 마지막 캔들의 타임스탬프와 비교하여 중복이 아니면 추가
+                const lastTimestamp = history.length > 0 ? history[history.length - 1].timestamp : 0;
+                
+                if (candle.timestamp > lastTimestamp) {
+                     // 1분봉 마감 시간이 현재 저장된 마지막 시간보다 뒤일 경우에만 추가
+                     history.push(candle);
+                } else if (candle.timestamp === lastTimestamp) {
+                     // 만약 타임스탬프가 같다면, 이는 REST API의 마지막 캔들을 WS가 다시 마감한 경우일 수 있습니다.
+                     // 이 경우 데이터를 갱신합니다. (안정성 확보)
+                     history[history.length - 1] = candle;
+                }
+                
+                // 15개 캔들만 유지 (FIFO: First-In, First-Out)
+                if (history.length > CANDLE_COUNT) {
+                    history.shift(); // 가장 오래된 캔들 제거
+                }
+                
+                // 15개 캔들이 모였을 때만 분석 실행 (초기 로딩으로 이미 충족될 가능성이 높음)
+                if (history.length === CANDLE_COUNT) {
+                    calculateSurge(symbol);
+                }
+                
+                // 매 캔들 마감 시 UI 업데이트
+                updateMonitorListUI();
+            }
+        }
+    }
+
+    function connectWebSocket() {
+        if (ws) {
+            ws.close();
+        }
+        
+        updateStatus('WebSocket 연결 중...', 'yellow');
+
+        // 모니터링할 스트림 목록 생성 (예: btcusdt@kline_1m/ethusdt@kline_1m/...)
+        const streams = BASE_SYMBOLS.map(s => `${s.toLowerCase()}@kline_${INTERVAL}`);
+        const wsUrl = BINANCE_WS_BASE + streams.join('/');
+        
+        // REST API 로딩이 완료된 symbolData 구조를 사용합니다.
+        
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+            updateStatus('🟢 모니터링 활성화됨', 'green');
+            startButton.textContent = '모니터링 중지';
+            startButton.classList.remove('bg-blue-600', 'hover:bg-blue-700');
+            startButton.classList.add('bg-red-600', 'hover:bg-red-700');
+            isMonitoring = true;
+        };
+
+        ws.onmessage = handleMessage;
+
+        ws.onclose = () => {
+            if (isMonitoring) {
+                updateStatus('❌ 연결 끊김. 재연결 시도 중...', 'red');
+                // 5초 후 재연결 시도
+                setTimeout(connectWebSocket, 5000); 
+            } else {
+                 updateStatus('연결 중지됨', 'yellow');
+            }
+        };
+
+        ws.onerror = (error) => {
+            console.error('WebSocket 오류 발생:', error);
+            updateStatus('❌ 연결 오류 발생', 'red');
+            // 오류 발생 시에도 재연결 로직을 타도록 close를 호출
+            ws.close(); 
+        };
+    }
+
+    function disconnectWebSocket() {
+        if (ws) {
+            isMonitoring = false;
+            ws.close();
+            ws = null;
+            updateStatus('모니터링 중지됨', 'yellow');
+            startButton.textContent = '모니터링 시작';
+            startButton.classList.remove('bg-red-600', 'hover:bg-red-700');
+            startButton.classList.add('bg-blue-600', 'hover:bg-blue-700');
+        }
+    }
+    
+    // =================================================================
+    // 5. 메인 컨트롤러 및 초기 실행
+    // =================================================================
+
+    function toggleMonitor() {
+        if (isMonitoring) {
+            disconnectWebSocket();
+        } else {
+            // WS 연결 전, 초기 데이터가 로드되었는지 확인
+            const allLoaded = Object.values(symbolData).every(data => !data.isLoading);
+            if (Object.keys(symbolData).length === 0 || !allLoaded) {
+                 // 데이터 로드가 아직 안되었거나 로드에 실패한 경우
+                 alert("초기 데이터 로딩이 완료되지 않았습니다. 잠시 후 다시 시도해 주세요.");
+                 return;
+            }
+            connectWebSocket();
+        }
+    }
+    
+    // 페이지 로드 시 초기 데이터 로딩 시작
+    document.addEventListener('DOMContentLoaded', loadInitialData);
+    
+</script>
+
+</body>
+</html>
